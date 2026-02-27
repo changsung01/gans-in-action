@@ -7,11 +7,14 @@
 4. [Grid-Based Generation: The Magic Behind Figure 2.7](#grid-based-generation-the-magic-behind-figure-27)
 5. [Mathematical Intuition](#mathematical-intuition)
 
+**Appendices**
+- [Appendix A: Intuition Behind the KL Divergence Loss](#appendix-a-intuition-behind-the-kl-divergence-loss)
+
 ---
 
 ## Overall VAE Flow
 
-Your understanding is correct! Here's the complete flow:
+The complete flow of VAE:
 
 ```
 Input Image (x) 
@@ -267,3 +270,35 @@ n = 30  # 30x30 grid instead of 15x15
 ```
 
 Each variation will reveal different aspects of how the decoder organizes the latent space!
+
+---
+
+## Appendix A: Intuition Behind the KL Divergence Loss
+
+KL divergence measures **how much one probability distribution differs from another**. In a VAE, it forces the encoder's learned distribution $q(z|x)$ to stay close to the prior $p(z) = \mathcal{N}(0, I)$.
+
+$$D_{KL}(q(z|x) \| p(z)) = -\frac{1}{2} \sum_j \left(1 + \log \sigma_j^2 - \mu_j^2 - \sigma_j^2 \right)$$
+
+Breaking down each term's role:
+
+**$-\mu_j^2$ — penalizes mean shift**
+If the encoder pushes $\mu$ far from 0, this term grows, pulling the latent means back toward the origin. Without it, different inputs could encode to completely separate regions of latent space, breaking continuity.
+
+**$-\sigma_j^2$ — penalizes variance collapse or explosion**
+Encourages $\sigma$ toward 1. If the encoder collapses variance to ~0, it becomes a deterministic autoencoder with no generative capability. This term prevents that.
+
+**$+\log \sigma_j^2$ — rewards non-zero variance (counteracts above)**
+This term fights against the previous one — it rewards spreading the distribution out. The interplay between $-\sigma^2$ and $+\log\sigma^2$ reaches equilibrium at $\sigma = 1$.
+
+**$+1$ — a normalization constant**
+Ensures $D_{KL} = 0$ exactly when $\mu = 0, \sigma = 1$ (i.e., perfect match with the prior).
+
+### The Big Picture
+
+| Without KL loss | With KL loss |
+|---|---|
+| Encoder can place each input wherever it wants | Encoder is pushed toward $\mathcal{N}(0, I)$ |
+| Latent space has "holes" — no smooth interpolation | Latent space is dense, continuous, and interpolatable |
+| Model is just a (better) autoencoder | Model is a true generative model |
+
+The KL term is essentially a **regularizer**: it trades off some reconstruction fidelity to ensure the latent space has a well-structured, smooth geometry that enables generation from random samples.
