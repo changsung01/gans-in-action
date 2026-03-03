@@ -240,16 +240,124 @@ def train_generator_step(batch_size):
 
 ---
 
+## Issue 7: Removed sub-module import paths for layers
+
+**Error:**
+```
+ImportError: cannot import name 'LeakyReLU' from 'keras.layers.advanced_activations'
+ImportError: cannot import name 'Conv2D' from 'keras.layers.convolutional'
+```
+
+**Cause:** Keras 3 removed the internal sub-module structure. All layers are now imported directly from `keras.layers`.
+
+**Fix:** Consolidate all layer imports into a single `from keras.layers import ...` statement.
+
+| Old | New |
+|---|---|
+| `from keras.layers.advanced_activations import LeakyReLU` | `from keras.layers import LeakyReLU` |
+| `from keras.layers.convolutional import Conv2D, Conv2DTranspose` | `from keras.layers import Conv2D, Conv2DTranspose` |
+| `from keras.layers.normalization import BatchNormalization` | `from keras.layers import BatchNormalization` |
+
+---
+
+## Issue 8: `LeakyReLU(alpha=...)` parameter renamed
+
+**Warning:**
+```
+UserWarning: Argument `alpha` is deprecated. Use `negative_slope` instead.
+```
+
+**Fix:** Replace `alpha` with `negative_slope` in all `LeakyReLU` instantiations.
+
+```python
+# Old
+LeakyReLU(alpha=0.01)
+
+# New
+LeakyReLU(negative_slope=0.01)
+```
+
+---
+
+## Issue 9: BatchNorm `training` flag mismatch in GAN generator step
+
+**Symptom:** With BatchNormalization in the discriminator, D loss collapses to ~0, D accuracy locks at 100%, and G loss also collapses to ~0 — a paradoxical state impossible in a correctly functioning GAN.
+
+**Cause:** The `training` flag controls two **independent** things:
+
+| Aspect | Controlled by |
+|---|---|
+| BatchNorm behaviour (batch stats vs. running stats) | `training=True/False` passed to model call |
+| Which weights get updated | Which variables are passed to `apply_gradients` |
+
+In the GradientTape implementation, calling `discriminator(fake_imgs, training=False)` inside `train_generator_step` makes the discriminator's BatchNorm use **running statistics** (accumulated over previous batches), while the discriminator training step uses **batch statistics** (`training=True`). These differ significantly, especially early in training, causing the discriminator to behave inconsistently between its two contexts. This creates the paradox: D classifies correctly during its own step but appears fooled during the generator step.
+
+The original `gan.train_on_batch()` always called everything in `training=True` mode, so this inconsistency never arose.
+
+**Fix:** In `train_generator_step`, call the discriminator with `training=True`. The discriminator weights are still not updated — that is controlled by only passing `generator.trainable_variables` to `apply_gradients`, independent of the `training` flag.
+
+```python
+def train_generator_step(batch_size):
+    z = tf.random.normal((batch_size, z_dim))
+    real_labels = tf.ones((batch_size, 1))
+
+    with tf.GradientTape() as tape:
+        fake_imgs = generator(z, training=True)
+        # training=True: BatchNorm uses batch statistics (consistent with D training step)
+        # Discriminator weights NOT updated: only generator.trainable_variables passed below
+        fake_output = discriminator(fake_imgs, training=True)
+        g_loss = cross_entropy(real_labels, fake_output)
+
+    grads = tape.gradient(g_loss, generator.trainable_variables)
+    g_optimizer.apply_gradients(zip(grads, generator.trainable_variables))
+    return float(g_loss)
+```
+
+**Note:** This only manifests in networks with BatchNormalization in the discriminator. Chapter 3 (no BatchNorm) was unaffected. Chapters 4+ all have BatchNorm in the discriminator and require this fix.
+
+---
+
+## Issue 10: Redundant `input_shape` in non-first Conv2D layers
+
+**Warning:**
+```
+UserWarning: Do not pass an `input_shape`/`input_dim` argument to a layer.
+When using Sequential models, prefer using an Input(shape) object as the first layer.
+```
+
+**Cause:** The original code passed `input_shape=img_shape` to every `Conv2D` layer in the discriminator, but only the first layer needs it. Keras 3 warns on all subsequent ones.
+
+**Fix:** Only keep `input_shape` on the **first** layer of a Sequential model; remove it from all subsequent layers.
+
+
+```python
+# Old — input_shape on every Conv2D (wrong)
+model.add(Conv2D(32,  kernel_size=3, strides=2, input_shape=img_shape, padding='same'))
+model.add(Conv2D(64,  kernel_size=3, strides=2, input_shape=img_shape, padding='same'))  # redundant
+model.add(Conv2D(128, kernel_size=3, strides=2, input_shape=img_shape, padding='same'))  # redundant
+
+# New — input_shape only on first layer
+model.add(Conv2D(32,  kernel_size=3, strides=2, input_shape=img_shape, padding='same'))
+model.add(Conv2D(64,  kernel_size=3, strides=2, padding='same'))
+model.add(Conv2D(128, kernel_size=3, strides=2, padding='same'))
+```
+
+---
+
 ## General Checklist for Each Chapter
 
 Before running any chapter notebook, scan for and fix:
 
 - [ ] `from keras import backend as K` and any `K.*` calls → replace with `keras.ops.*`
 - [ ] `from keras import metrics` and `metrics.*` loss/metric calls → use `keras.losses.*` or `keras.metrics.*` proper classes
+- [ ] `from keras.layers.advanced_activations import ...` or `from keras.layers.convolutional import ...` → consolidate into `from keras.layers import ...` (Issue 7)
+- [ ] `LeakyReLU(alpha=...)` → `LeakyReLU(negative_slope=...)` (Issue 8)
+- [ ] `input_shape` on non-first layers in Sequential models → remove (Issue 9)
 - [ ] `Lambda(fn)` layers → replace with subclassed `keras.layers.Layer`
 - [ ] `tf.*` ops applied to model inputs/outputs inside model-building code → replace with `keras.ops.*`
 - [ ] Loss functions that capture KerasTensors as closures/defaults → refactor to subclassed model with `self.add_loss()`
 - [ ] GAN training using `discriminator.trainable = False` + `compile()` trick → replace with `tf.GradientTape` and per-model variable lists (Issue 6)
+- [ ] In `train_generator_step`, call `discriminator(fake_imgs, training=True)` not `training=False` when discriminator has BatchNorm (Issue 9)
 - [ ] Add `import keras` and `import tensorflow as tf` to imports if not present
 - [ ] After any code changes: **restart the kernel and run all cells from the top**
 
@@ -275,3 +383,17 @@ Before running any chapter notebook, scan for and fix:
 | Build/compile cell | Removed `discriminator.compile()`, `discriminator.trainable = False`, `build_gan()`, `gan.compile()`. Added `d_optimizer`, `g_optimizer`, `cross_entropy` |
 | Training loop | Replaced `discriminator.train_on_batch()` and `gan.train_on_batch()` with `train_discriminator_step()` and `train_generator_step()` using `tf.GradientTape` |
 | Compatibility note (markdown) | Updated to explain the Keras 3 dynamic `trainable` breaking change and the GradientTape fix |
+
+---
+
+## Chapter 4 — Applied Fixes Summary
+
+| Cell | Change |
+|---|---|
+| imports | Removed `from keras.layers.advanced_activations import LeakyReLU` and `from keras.layers.convolutional import Conv2D, Conv2DTranspose`; consolidated into single `from keras.layers import (...)`. Added `import tensorflow as tf` |
+| Generator (`build_generator`) | Removed `input_dim=z_dim` from `Dense`; changed `LeakyReLU(alpha=0.01)` → `LeakyReLU(negative_slope=0.01)` |
+| Discriminator (`build_discriminator`) | Removed redundant `input_shape=img_shape` from 2nd and 3rd `Conv2D` layers; changed `LeakyReLU(alpha=0.01)` → `LeakyReLU(negative_slope=0.01)` |
+| Build/compile cell | Removed `discriminator.compile()`, `discriminator.trainable = False`, `build_gan()`, `gan.compile()`. Added `d_optimizer`, `g_optimizer`, `cross_entropy` |
+| Training loop | Replaced `discriminator.train_on_batch()` and `gan.train_on_batch()` with `train_discriminator_step()` and `train_generator_step()` using `tf.GradientTape` |
+| Training loop (generator step) | Fixed `discriminator(fake_imgs, training=False)` → `training=True` to avoid BatchNorm running-stats mismatch (Issue 9) |
+| Compatibility note (markdown) | Updated to reference KERAS3_COMPAT.md Issue 6 |
