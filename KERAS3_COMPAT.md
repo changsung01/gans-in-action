@@ -167,6 +167,79 @@ NotImplementedError
 
 ---
 
+## Issue 6: `discriminator.trainable = False` no longer freezes weights at compile time (GAN training broken)
+
+**Symptom:** GAN produces only noise. Training metrics show discriminator failing completely:
+```
+100  [D loss: 5.27, acc.: 25.38%] [G loss: 0.010]
+6000 [D loss: 7.27, acc.: 25.24%] [G loss: 0.0001]
+```
+D accuracy stuck at ~25% (worse than random), D loss rising, G loss → 0.
+
+**Cause:** The classic Keras 2 GAN trick relied on `trainable` being **baked into the compiled graph**:
+
+```python
+# Old trick — worked in Keras 2 / old tf.keras
+discriminator.compile(...)          # compiled with trainable=True
+discriminator.trainable = False     # set AFTER compile
+gan.compile(...)                    # GAN compiled with discriminator frozen
+
+# discriminator.train_on_batch() → used its own compiled graph (trainable=True) ✓
+# gan.train_on_batch()           → used GAN's compiled graph (trainable=False) ✓
+```
+
+In **Keras 3**, `trainable` is evaluated **dynamically at every training step**, not at compile time. Setting `discriminator.trainable = False` freezes the discriminator globally — including when calling `discriminator.train_on_batch()` directly. The discriminator never learns, the generator trivially fools it, and training collapses.
+
+**Fix:** Replace `compile()` + `train_on_batch()` with `tf.GradientTape`, passing explicit variable lists to each optimizer so each step only updates the intended model's weights.
+
+```python
+import tensorflow as tf
+
+discriminator = build_discriminator(img_shape)
+generator = build_generator(img_shape, z_dim)
+
+d_optimizer = Adam()
+g_optimizer = Adam()
+cross_entropy = tf.keras.losses.BinaryCrossentropy()
+
+
+def train_discriminator_step(real_imgs, batch_size):
+    z = tf.random.normal((batch_size, z_dim))
+    real_labels = tf.ones((batch_size, 1))
+    fake_labels = tf.zeros((batch_size, 1))
+
+    with tf.GradientTape() as tape:
+        fake_imgs = generator(z, training=False)          # generator frozen
+        real_output = discriminator(real_imgs, training=True)
+        fake_output = discriminator(fake_imgs, training=True)
+        d_loss = (cross_entropy(real_labels, real_output)
+                  + cross_entropy(fake_labels, fake_output)) / 2
+
+    # Only discriminator variables updated
+    grads = tape.gradient(d_loss, discriminator.trainable_variables)
+    d_optimizer.apply_gradients(zip(grads, discriminator.trainable_variables))
+    return d_loss
+
+
+def train_generator_step(batch_size):
+    z = tf.random.normal((batch_size, z_dim))
+    real_labels = tf.ones((batch_size, 1))
+
+    with tf.GradientTape() as tape:
+        fake_imgs = generator(z, training=True)
+        fake_output = discriminator(fake_imgs, training=False)  # discriminator frozen
+        g_loss = cross_entropy(real_labels, fake_output)
+
+    # Only generator variables updated
+    grads = tape.gradient(g_loss, generator.trainable_variables)
+    g_optimizer.apply_gradients(zip(grads, generator.trainable_variables))
+    return g_loss
+```
+
+**Chapters affected:** Any chapter that trains a GAN using the `discriminator.trainable = False` + `compile()` pattern (chapters 3, 4, 5, 6, 7, 8, 9).
+
+---
+
 ## General Checklist for Each Chapter
 
 Before running any chapter notebook, scan for and fix:
@@ -176,7 +249,8 @@ Before running any chapter notebook, scan for and fix:
 - [ ] `Lambda(fn)` layers → replace with subclassed `keras.layers.Layer`
 - [ ] `tf.*` ops applied to model inputs/outputs inside model-building code → replace with `keras.ops.*`
 - [ ] Loss functions that capture KerasTensors as closures/defaults → refactor to subclassed model with `self.add_loss()`
-- [ ] Add `import keras` to imports if not present
+- [ ] GAN training using `discriminator.trainable = False` + `compile()` trick → replace with `tf.GradientTape` and per-model variable lists (Issue 6)
+- [ ] Add `import keras` and `import tensorflow as tf` to imports if not present
 - [ ] After any code changes: **restart the kernel and run all cells from the top**
 
 ---
@@ -190,3 +264,14 @@ Before running any chapter notebook, scan for and fix:
 | Encoder | Changed `Lambda(sampling)(...)` → `Sampling()(...)` |
 | VAE model | Changed Functional model + closure loss → `class VAE(keras.Model)` with `self.add_loss()` in `call()` |
 | `vae_loss` | Replaced with `xent_loss` (reconstruction only); KL moved into VAE `call()` |
+
+---
+
+## Chapter 3 — Applied Fixes Summary
+
+| Cell | Change |
+|---|---|
+| imports | Added `import tensorflow as tf` |
+| Build/compile cell | Removed `discriminator.compile()`, `discriminator.trainable = False`, `build_gan()`, `gan.compile()`. Added `d_optimizer`, `g_optimizer`, `cross_entropy` |
+| Training loop | Replaced `discriminator.train_on_batch()` and `gan.train_on_batch()` with `train_discriminator_step()` and `train_generator_step()` using `tf.GradientTape` |
+| Compatibility note (markdown) | Updated to explain the Keras 3 dynamic `trainable` breaking change and the GradientTape fix |
